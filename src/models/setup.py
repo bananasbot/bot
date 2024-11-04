@@ -7,7 +7,7 @@ class Setup:
         timepoints: int,
         specs: list[Spec],
         capabilities: list[Capability],
-        spec_can: dict[(Spec, Capability), bool],
+        spec_can: dict[tuple[Spec, Capability], bool],
     ):
         """Planner params for players"""
 
@@ -23,7 +23,7 @@ class Setup:
         self.CAPABILITIES: list[Capability]
         """the list of capabilities"""
 
-        self.SPEC_CAN: dict[(Spec, Capability), bool]
+        self.SPEC_CAN: dict[tuple[Spec, Capability], bool]
         """whether a class can cover that requirement"""
 
         self.T = timepoints

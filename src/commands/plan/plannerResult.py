@@ -4,12 +4,12 @@ from config import *
 class PlannerResult:
     def __init__(
         self,
-        happiness,
-        players,
-        playhours,
-        start,
+        happiness: float,
+        teamToPlayers: list[tuple[PlayerId, Spec]],
+        start: Timepoint,
+        playhours: list[Timepoint],
     ):
         self.happiness: float = happiness
+        self.teamToPlayers: list[tuple[PlayerId, Spec]] = teamToPlayers
         self.start: Timepoint = start
-        self.playerToSpec: list[(PlayerId, Spec)] = players
         self.playhours: list[Timepoint] = playhours

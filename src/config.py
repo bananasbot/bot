@@ -14,6 +14,7 @@ Preference = int
 
 PlayerId = int
 RaidId = str
+TeamId = int
 
 # Directories
 root = curdir

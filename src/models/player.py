@@ -20,7 +20,7 @@ class Player:
         if any((p < 0 or config.maxPreference < p) for p in preferences):
             raise f"preference out of bounds"
 
-        self.specs: dict[(Spec, Raid), bool] = {
+        self.specs: dict[tuple[Spec, Raid], bool] = {
             (s, r): 0 for s in setup.SPECS for r in raids
         }
         self.specs.update({(s, r): 1 for s in specs for r in specs[s]})

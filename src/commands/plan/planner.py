@@ -17,8 +17,11 @@ class Planner:
         setup: Setup,
         raid: Raid,
         players: dict[int, Player],
+        teams: int,
         forbids: list[Timepoint],
-    ) -> PlannerResult:
+    ) -> dict[TeamId, PlannerResult]:
+        TEAMS = range(teams)
+
         solver: Solver = Solver.CreateSolver("SAT")
         if not solver:
             raise "Could not create solver"
@@ -28,26 +31,30 @@ class Planner:
         ########
 
         # is this spec gonna be played by this player?
-        selected: dict[(PlayerId, Spec), bool] = {}
-        for pid in players:
-            for s in setup.SPECS:
-                selected[(pid, s)] = solver.BoolVar(f"selected_{pid}_{s}")
+        selected: dict[tuple[PlayerId, Spec, TeamId], bool] = {}
+        for t in TEAMS:
+            for pid in players:
+                for s in setup.SPECS:
+                    selected[(pid, s, t)] = solver.BoolVar(f"selected_{pid}_{s}_{t}")
 
-        # will this hour be played?
-        playhours: dict[Timepoint, bool] = {}
+        # will this hour be played by this team?
+        playhours: dict[tuple[Timepoint, TeamId], bool] = {}
         for h in setup.TIMEPOINTS:
-            playhours[h] = solver.BoolVar(f"playhours_{h}")
+            for t in TEAMS:
+                playhours[(h, t)] = solver.BoolVar(f"playhours_{h}_{t}")
 
         # is the raid gonna start at this time?
-        start: dict[Timepoint, bool] = {}
+        start: dict[tuple[Timepoint, TeamId], bool] = {}
         for h in setup.TIMEPOINTS:
-            start[h] = solver.BoolVar(f"start_{h}")
+            for t in TEAMS:
+                start[(h, t)] = solver.BoolVar(f"start_{h}_{t}")
 
-        # has this player been chosen to play?
-        plays: dict[(PlayerId, Timepoint), bool] = {}
-        for pid in players:
-            for h in setup.TIMEPOINTS:
-                plays[(pid, h)] = solver.BoolVar(f"plays_{pid}_{h}")
+        # has this player been chosen to play for this team?
+        plays: dict[tuple[PlayerId, Timepoint, TeamId], bool] = {}
+        for t in TEAMS:
+            for pid in players:
+                for h in setup.TIMEPOINTS:
+                    plays[(pid, h, t)] = solver.BoolVar(f"plays_{pid}_{h}_{t}")
 
         #############
         # OBJECTIVE #
@@ -56,70 +63,97 @@ class Planner:
         # non linear function, to skew toward high preferences
         # https://www.desmos.com/calculator/e4zvxwz0xx (curve in green, where M = maxPreference)
         objective: Objective = solver.Objective()
-        for pid in players:
-            for h in setup.TIMEPOINTS:
-                objective.SetCoefficient(
-                    plays[(pid, h)],
-                    (1 - cos(pi * players[pid].preference[h] / maxPreference)) / 2,
-                )
+        for t in TEAMS:
+            for pid in players:
+                for h in setup.TIMEPOINTS:
+                    objective.SetCoefficient(
+                        plays[(pid, h, t)],
+                        (1 - cos(pi * players[pid].preference[h] / maxPreference)) / 2,
+                    )
         objective.SetMaximization()
 
         ###############
         # CONSTRAINTS #
         ###############
 
-        # select_implies_can_run
+        # selected ==> can run
         for pid in players:
             for s in setup.SPECS:
-                solver.Add(selected[(pid, s)] <= players[pid].specs[(s, raid.id)])
+                for t in TEAMS:
+                    solver.Add(
+                        selected[(pid, s, t)] <= players[pid].specs[(s, raid.id)]
+                    )
 
-        # at_most_one_char_per_player_selected
-        for pid in players:
-            solver.Add(solver.Sum(selected[(pid, s)] for s in setup.SPECS) <= 1)
+        # at most one char can be selected for each (player,team)
+        for t in TEAMS:
+            for pid in players:
+                solver.Add(solver.Sum(selected[(pid, s, t)] for s in setup.SPECS) <= 1)
 
-        # fulfill_all_raid_requirements
-        for c in setup.CAPABILITIES:
-            s = solver.Sum(
-                selected[(pid, s)] * setup.SPEC_CAN[(s, c)]
-                for pid in players
-                for s in setup.SPECS
-            )
-            solver.Add(raid.min_requirements[c] <= s)
-            solver.Add(s <= raid.max_requirements[c])
-
-        # people amount bounds
-        p = solver.Sum(selected[(pid, s)] for pid in players for s in setup.SPECS)
-        solver.Add(raid.min_people <= p)
-        solver.Add(p <= raid.max_people)
-
-        # single_start_1
-        for h in setup.TIMEPOINTS:
-            solver.Add(
-                playhours[(h + 1) % setup.T] - playhours[h] <= start[(h + 1) % setup.T]
-            )
-
-        # single_start_2
-        solver.Add(solver.Sum(start[h] for h in setup.TIMEPOINTS) == 1)
-
-        # suppress_play
-        for pid in players:
-            for h in setup.TIMEPOINTS:
-                # plays_means_has_been_selected
-                solver.Add(
-                    plays[(pid, h)]
-                    <= solver.Sum(selected[(pid, c)] for c in setup.SPECS)
+        # each team fulfills all raid requirements
+        for t in TEAMS:
+            for c in setup.CAPABILITIES:
+                covered = solver.Sum(
+                    selected[(pid, s, t)] * setup.SPEC_CAN[(s, c)]
+                    for pid in players
+                    for s in setup.SPECS
                 )
-                # plays_implies_playhours
-                solver.Add(plays[(pid, h)] <= playhours[h])
-                # plays_implies_not_preference_at_0
-                solver.Add(plays[(pid, h)] <= players[pid].preference[h])
+                solver.Add(raid.min_requirements[c] <= covered)
+                solver.Add(covered <= raid.max_requirements[c])
+
+        # bound teams size
+        siz = solver.Sum(
+            selected[(pid, s, t)] for t in TEAMS for pid in players for s in setup.SPECS
+        )
+        solver.Add(raid.min_people <= siz)
+        solver.Add(siz <= raid.max_people)
+
+        # starting to play ==> start
+        for t in TEAMS:
+            for h in setup.TIMEPOINTS:
+                # detect change in playhours 0 -> 1, that implies start of play
+                solver.Add(
+                    playhours[((h + 1) % setup.T, t)] - playhours[(h, t)]
+                    <= start[((h + 1) % setup.T, t)]
+                )
+
+        # suppress multiple starts
+        for t in TEAMS:
+            solver.Add(solver.Sum(start[(h, t)] for h in setup.TIMEPOINTS) == 1)
+
+        # suppress plays
+        for t in TEAMS:
+            for pid in players:
+                for h in setup.TIMEPOINTS:
+                    # plays_means_has_been_selected
+                    solver.Add(
+                        plays[(pid, h, t)]
+                        <= solver.Sum(selected[(pid, c, t)] for c in setup.SPECS)
+                    )
+                    # plays_implies_playhours
+                    solver.Add(plays[(pid, h, t)] <= playhours[(h, t)])
+                    # plays_implies_not_preference_at_0
+                    solver.Add(plays[(pid, h, t)] <= players[pid].preference[h])
+
+        # given a timepoint and a player, it can only play in one team
+        for h in setup.TIMEPOINTS:
+            for pid in players:
+                solver.Add(solver.Sum(plays[(pid, h, t)] for t in TEAMS) <= 1)
+
+        # char locked for the week
+        for pid in players:
+            for s in setup.SPECS:
+                solver.Add(solver.Sum(selected[(pid, s, t)] for t in TEAMS) <= 1)
 
         # limit playtime
-        solver.Add(solver.Sum(playhours[h] for h in setup.TIMEPOINTS) == raid.length)
+        for t in TEAMS:
+            solver.Add(
+                solver.Sum(playhours[(h, t)] for h in setup.TIMEPOINTS) == raid.length
+            )
 
-        # forbid_times
-        for f in forbids:
-            solver.Add(playhours[f] == 0)
+        # # forbid_times
+        # for t in TEAMS:
+        #     for f in forbids:
+        #         solver.Add(playhours[(f, h)] == 0)
 
         #######
         # END #
@@ -128,15 +162,25 @@ class Planner:
         status = solver.Solve()
 
         if status == Solver.OPTIMAL:
-            pids = [
-                (pid, s)
-                for s in setup.SPECS
-                for pid in players
-                if selected[(pid, s)].solution_value()
-            ]
-            playhs = [h for h in setup.TIMEPOINTS if playhours[h].solution_value()]
-            st = [h for h in setup.TIMEPOINTS if start[h].solution_value()]
-
-            return PlannerResult(solver.Objective().Value(), pids, playhs, st[0])
+            return {
+                t: PlannerResult(
+                    happiness=solver.Objective().Value(),
+                    teamToPlayers=[
+                        (pid, s)
+                        for pid in players
+                        for s in setup.SPECS
+                        if selected[(pid, s, t)].solution_value()
+                    ],
+                    playhours=[
+                        h
+                        for h in setup.TIMEPOINTS
+                        if playhours[(h, t)].solution_value()
+                    ],
+                    start=[
+                        h for h in setup.TIMEPOINTS if start[(h, t)].solution_value()
+                    ][0],
+                )
+                for t in TEAMS
+            }
         else:
-            return []
+            return None
